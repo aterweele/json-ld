@@ -1,6 +1,7 @@
 (ns json-ld.context
   "Implementation of JSON-LD context processing
   algorithms (https://www.w3.org/TR/json-ld-api/#context-processing-algorithms)."
+  (:refer-clojure :exclude [keyword?])
   (:require [clojure.string :as str]))
 
 ;;; helpers that may be moved to other namespaces
@@ -31,6 +32,18 @@
   ;; object with an @context member, an invalid remote context has
   ;; been detected and processing is aborted; ..."
   (RuntimeException. "TODO implement"))
+
+(defn keyword?
+  [s]
+  ;; also, maybe do this as a set of the JSON-LD reserved keywords.
+  (RuntimeException. "TODO implement"))
+
+(defn expand-iri
+  ([active-context type] (expand-iri active-context type nil))
+  ([active-context
+    type
+    {:keys [document-relative? vocab? local-context defined]}]
+   (RuntimeException. "TODO implement")))
 
 (declare create-term-definition)
 
@@ -121,7 +134,9 @@
           ;; "(3.3) If context is not a JSON object, an invalid local
           ;; context error has been detected and processing is
           ;; aborted."
-          (complement map?)
+          (complement map?
+                      ;; TODO: maybe could use `associative?`
+                      )
           (throw (ex-info "invalid local context: unexpected type"
                           {:invalid-local-context context}))
           (constantly true)
@@ -204,6 +219,8 @@
   ([active-context local-context document-iri]
    (contextualize* active-context local-context document-iri #{})))
 
+;; TODO this stupid function is so much bother that it might be worth
+;; doing with transients to mimic the spec's imperative style.
 (defn create-term-definition
   "https://www.w3.org/TR/json-ld-api/#h3_create-term-definition"
   ;; "(§ 6.2) Create Term Definition – This algorithm is called from
@@ -212,9 +229,11 @@
   ;; context."
 
   ;; returns: a new active context, a new `defined` (recursion),
-  ;; [others?] 
+  ;; [others?]. I think the right structure to return might be
+  ;; {:context ... :defined ...}.
   [active-context local-context term defined]
 
+  #_
   ;; "(1) If defined contains the key term..."
   (if-let [[_ term-defined] (find defined term)]
     ;; "...and the associated value is true (indicating that the term
@@ -225,5 +244,147 @@
       ;; Otherwise, if the value is false, a cyclic IRI mapping error
       ;; has been detected and processing is aborted."
       (throw (ex-info "cyclic IRI mapping"
-                      {;; TODO show the cycle
-                       })))))
+                      { ;; TODO show the cycle
+                       }))))
+  ;; "(1) If defined contains the key term..."
+  (if (contains? defined term)
+    ;; "...and the associated value is true (indicating that the term
+    ;; definition has already been created), return.
+    (if (get defined term)
+      ;; TODO return what?!
+      'todo
+      ;; Otherwise, if the value is false, a cyclic IRI mapping error
+      ;; has been detected and processing is aborted."
+      (throw (ex-info "cyclic IRI mapping"
+                      { ;; TODO show the cycle
+                       :defined defined
+                       :collided-term term})))
+    (let [;; "(2) Set the value associated with defined's term key to
+          ;; false. This indicates that the term definition is now
+          ;; being created but is not yet complete."
+          defined (assoc defined term false)
+          ;; "(3) Since keywords cannot be overridden, term must not be a
+          ;; keyword. Otherwise, a keyword redefinition error has been
+          ;; detected and processing is aborted."
+          _ (when (keyword? term)
+              (throw (ex-info "keyword redefinition"
+                              {:keyword term})))
+          ;; "(4) Remove any existing term definition for term in
+          ;; active context."
+          active-context (update active-context
+                                 :term-definitions
+                                 #(dissoc % term))
+          ;; "(5) Initialize value to a copy of the value associated
+          ;; with the key term in local context."
+          value (get-in local-context [:term-definitions term])]
+      ;; "(6) If value is null or value is a JSON object containing
+      ;; the key-value pair @id-null, ..."
+      (if (or (nil? value)
+              (and (#_map? associative? value)
+                   (= ["@id" nil] (find value "@id"))))
+        ;; "... set the term definition in active context to null, set
+        ;; the value associated with defined's key term to true, and
+        ;; return."
+        {:active-context (assoc-in active-context
+                                   [:term-definitions term]
+                                   nil)
+         :defined (assoc defined term true)}
+        (let [ ;; "(7) Otherwise, if value is a string, convert it to a
+              ;; JSON object consisting of a single member whose key
+              ;; is @id and whose value is value."
+              value (or (and (string? value)
+                             {"@id" value})
+                        value)
+              ;; "(8) Otherwise, value must be a JSON object, if not,
+              ;; an invalid term definition error has been detected
+              ;; and processing is aborted."
+              _ (when-not (#_map? associative? value)
+                  (throw (ex-info "invalid term definition: unexpected type"
+                                  {:term value})))]
+          ;; Compose the return value here.
+          {:active-context
+           (assoc-in
+            active-context
+            [:term-definitions term]
+            ;; "(9) Create a new term definition, definition." Note
+            ;; that the term definition is this `(merge ...)`
+            ;; expression. We do not bind a `definition`.
+            (merge
+             ;; "(10) If value contains the key @type: (10.1) Initialize
+             ;; type to the value associated with the @type key, which
+             ;; must be a string. Otherwise, an invalid type mapping
+             ;; error has been detected and processing is aborted."
+             (when-let [[_ type] (find value "@type")]
+               (when-not (string? type)
+                 (throw (ex-info "invalid type mapping"
+                                 {:type type})))
+               ;; "(10.2) Set type to the result of using the IRI
+               ;; Expansion algorithm, passing active context, type for
+               ;; value, true for vocab, false for document relative,
+               ;; local context, and defined. If the expanded type is
+               ;; neither @id, nor @vocab, nor an absolute IRI, an
+               ;; invalid type mapping error has been detected and
+               ;; processing is aborted."
+               (let [type (expand-iri active-context
+                                      type
+                                      {:vocab? true
+                                       :local-context local-context
+                                       :defined defined})]
+                 ;; "(10.3) Set the type mapping for definition to
+                 ;; type."
+                 {:type-mapping type}))
+             ;; "(11) If value contains the key @reverse:"
+             (if-let [[_ reverse-value] (find value "@reverse")]
+               (do
+                 ;; "(11.1) If value contains an @id, member, an
+                 ;; invalid reverse property error has been detected
+                 ;; and processing is aborted."
+                 (when (contains? value "@id")
+                   (throw (ex-info "invalid reverse property"
+                                   {:value value})))
+                 ;; "(11.2) If the value associated with the @reverse
+                 ;; key is not a string, an invalid IRI mapping error
+                 ;; has been detected and processing is aborted.
+                 (when-not (string? reverse-value)
+                   (throw (ex-info "invalid IRI mappping"
+                                   {:illegal-reverse reverse-value})))
+                 (merge
+                  {;; "(11.3) Otherwise, set the IRI mapping of
+                   ;; definition to the result of using the IRI
+                   ;; Expansion algorithm, passing active context, the
+                   ;; value associated with the @reverse key for
+                   ;; value, true for vocab, false for document
+                   ;; relative, local context, and defined. If the
+                   ;; result is neither an absolute IRI nor a blank
+                   ;; node identifier, i.e., it contains no colon (:),
+                   ;; an invalid IRI mapping error has been detected
+                   ;; and processing is aborted.
+                   :iri-mapping
+                   (let [iri (expand-iri active-context
+                                         reverse-value
+                                         {:vocab? true
+                                          :local-context local-context
+                                          :defined defined})]
+                     (when-not ((some-fn absolute-iri? blank-node-identifier?)
+                                iri)
+                       (throw (ex-info "invalid IRI mapping"
+                                       {:iri iri}))))}
+                  ;; "(11.4) If value contains an @container member,
+                  ;; set the container mapping of definition to its
+                  ;; value; if its value is neither @set, nor @index,
+                  ;; nor null, an invalid reverse property error has
+                  ;; been detected (reverse properties only support
+                  ;; set- and index-containers) and processing is
+                  ;; aborted."
+                  (when-let [[_ container-mapping] (find value "@container")]
+                    (when-not (contains? #{"@set" "@index" nil}
+                                         container-mapping)
+                      (throw (ex-info "invalid reverse property"
+                                      {:invalid-container container-mapping})))
+                    {:container-mapping container-mapping})
+                  ;; "(11.5) Set the reverse property flag of definition
+                  ;; to true."
+                  :reverse-property? true
+                  ;; TODO figure out what to do about (11.6), because
+                  ;; we cannot (assoc defined term true) here.
+                  )))))})))))
