@@ -232,20 +232,6 @@
   ;; [others?]. I think the right structure to return might be
   ;; {:context ... :defined ...}.
   [active-context local-context term defined]
-
-  #_
-  ;; "(1) If defined contains the key term..."
-  (if-let [[_ term-defined] (find defined term)]
-    ;; "...and the associated value is true (indicating that the term
-    ;; definition has already been created), return.
-    (if term-defined
-      ;; TODO return what?!
-      'todo
-      ;; Otherwise, if the value is false, a cyclic IRI mapping error
-      ;; has been detected and processing is aborted."
-      (throw (ex-info "cyclic IRI mapping"
-                      { ;; TODO show the cycle
-                       }))))
   ;; "(1) If defined contains the key term..."
   (if (contains? defined term)
     ;; "...and the associated value is true (indicating that the term
@@ -388,3 +374,59 @@
                   ;; TODO figure out what to do about (11.6), because
                   ;; we cannot (assoc defined term true) here.
                   )))))})))))
+
+(defn create-term-definition!
+  "https://www.w3.org/TR/json-ld-api/#h3_create-term-definition
+
+  `active-context`, `local-context`, and `defined` are transient."
+  [{:as active-context
+    :keys [term-definitions]}
+   local-context                        ; TODO probably this doesn't
+                                        ; need to be transient.
+   term
+   defined]
+  ;; "(1) If defined contains the key term..."
+  (if (contains? defined term)
+    ;; "...and the associated value is true (indicating that the term
+    ;; definition has already been created), return.
+    (if (get defined term)
+      {:context active-context :defined defined}
+      ;; Otherwise, if the value is false, a cyclic IRI mapping error
+      ;; has been detected and processing is aborted."
+      (throw (ex-info "cyclic IRI mapping"
+                      ;; TODO show the cycle
+                      {:defined defined
+                       :collided-term term})))
+    (do
+      ;; "(2) Set the value associated with defined's term key to
+      ;; false. This indicates that the term definition is now being
+      ;; created but is not yet complete."
+      (assoc! defined term false)
+      ;; "(3) Since keywords cannot be overridden, term must not be a
+      ;; keyword. Otherwise, a keyword redefinition error has been
+      ;; detected and processing is aborted."
+      (when (keyword? term)
+        (throw (ex-info "keyword redefinition"
+                        {:keyword term})))
+      ;; "(4) Remove any existing term definition for term in active
+      ;; context."
+      (assoc! active-context
+              :term-definitions
+              ;; Make it a transient as it will be a site for mutation
+              ;; later.
+              (transient (dissoc term-definitions term)))
+      (let [;; "(5) Initialize value to a copy of the value associated
+            ;; with the key term in local context."
+            value (get local-context term)]
+        ;; this is where it starts to get tricky. (6) and (11) require
+        ;; return.
+
+        ;; Options: deeper and deeper nesting of conditions and
+        ;; binding (confusing, functional); monads (continuation monad
+        ;; for return and state and error monads could also help);
+        ;; custom subclasses of Throwable (could be sugared with a
+        ;; `with-return` macro); effects maybe
+        ;; (https://lilac.town/writing/effects-in-clojure/ , which
+        ;; also mentions conditions); implement the algorithm
+        ;; non-literally.
+        ))))
