@@ -3,6 +3,7 @@
   algorithms (https://www.w3.org/TR/json-ld-api/#context-processing-algorithms)."
   (:refer-clojure :exclude [keyword?])
   (:require [better-cond.core :as engelberg]
+            [clojure.set :as set]
             [clojure.string :as str]))
 
 ;;; helpers that may be moved to other namespaces
@@ -12,6 +13,18 @@
   (RuntimeException. "TODO implement"))
 
 (defn relative-iri?
+  [iri]
+  (RuntimeException. "TODO implement"))
+
+(defn compact-iri?
+  [iri]
+  (RuntimeException. "TODO implement"))
+
+(defn compact-iri-prefix
+  [iri]
+  (RuntimeException. "TODO implement"))
+
+(defn compact-iri-suffix
   [iri]
   (RuntimeException. "TODO implement"))
 
@@ -409,44 +422,43 @@
                             (when (= iri "@context")
                               (throw (ex-info "invalid keyword alias"
                                               {:iri iri})))
-                            {:iri-mapping iri}))))
-          ;; "(14) Otherwise if the term contains a colon (:):"
-
-          ;; Note that I am treating 14.1,2, and 3 as mutually
-          ;; exclusive.
-          #_#_
-          TODO (if (str/includes? term ":") ; what are we doing here?
-                                            ; seem like we make a new
-                                            ; `active-context`,
-                                            ; `defined`, and/or
-                                            ; `definition`.
-                 (cond
-                   ;; "(14.1) If term is a compact IRI with a prefix
-                   ;; that is a key in local context a dependency has
-                   ;; been found. Use this algorithm recursively
-                   ;; passing active context, local context, the
-                   ;; prefix as term, and defined."
-                                        ; TODO make a compact-iri
-                                        ; namespace.
-                   (and (compact-iri? term)
-                        (contains? local-context (compact-iri-prefix term)))
-                                        ; TODO and do what with the
-                                        ; result, exactly?
-                   (create-term-definition active-context local-context)
-                   ;; "(14.2) If term's prefix has a term definition
-                   ;; in active context, set the IRI mapping of
-                   ;; definition to the result of concatenating the
-                   ;; value associated with the prefix's IRI mapping
-                   ;; and the term's suffix."
-                   (get-in active-context [:term-definitions (compact-iri-prefix term)])
-                   (assoc definition
-                          :iri-mapping
-                          (str (get-in active-context [:term-definitions (compact-iri-prefix term)])
-                               (compact-iri-suffix term)))
-                   ;; "(14.3) Otherwise, term is an absolute IRI or
-                   ;; blank node identifier. Set the IRI mapping of
-                   ;; definition to term."
-                   :else (assoc definition :iri-mapping term)))]
+                            {:iri-mapping iri}))))]
+    ;; (14). Very ugly. This section of the algorithm heavily assumes
+    ;; mutability, whereas I have to track what could be modified with
+    ;; `returns`. Each branch of the `engelberg/cond` yields an
+    ;; updated `returns`.
+    :let [{:keys [active-context defined definition]}
+          (engelberg/cond
+            :let [returns {:active-context active-context
+                           :defined defined
+                           :definition definition}]
+            ;; "(14) Otherwise if the term contains a colon (:):"
+            ;; (Note that this is more naturally expressed backwards)
+            (not (str/includes? term ":")) returns
+            ;; "(14.1) If term is a compact IRI with a prefix that is
+            ;; a key in local context a dependency has been found. Use
+            ;; this algorithm recursively passing active context,
+            ;; local context, the prefix as term, and defined."
+            :let [{:as returns
+                   :keys [active-context defined definition]}
+                  (merge returns
+                         (when (and (compact-iri? term)
+                                    (contains? local-context (compact-iri-prefix term)))
+                           (set/rename-keys (create-term-definition active-context local-context)
+                                            {:context :active-context})))]
+            ;; "(14.2) If term's prefix has a term definition in
+            ;; active context, set the IRI mapping of definition to
+            ;; the result of concatenating the value associated with
+            ;; the prefix's IRI mapping and the term's suffix."
+            (get-in active-context [:term-definitions (compact-iri-prefix term)])
+            (assoc-in returns
+                      [:definition :iri-mapping]
+                      (str (get-in active-context [:term-definitions (compact-iri-prefix term)])
+                           (compact-iri-suffix term)))
+            ;; "(14.3) Otherwise, term is an absolute IRI or blank
+            ;; node identifier. Set the IRI mapping of definition to
+            ;; term."
+            (assoc-in returns [:definition :iri-mapping term]))]
     ;; "(15) Otherwise, if active context has a vocabulary mapping,
     ;; the IRI mapping of definition is set to the result of
     ;; concatenating the value associated with the vocabulary mapping
