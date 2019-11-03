@@ -25,6 +25,10 @@
   [_ binding child]
   `(if-let ~binding ~child ~child))
 
+(defn iri?
+  [iri]
+  (RuntimeException. "TODO implement"))
+
 (defn absolute-iri?
   [iri]
   (RuntimeException. "TODO implement"))
@@ -64,9 +68,21 @@
   (RuntimeException. "TODO implement"))
 
 (defn expand-iri
-  ([active-context type] (expand-iri active-context type nil))
+  ;; https://w3c.github.io/json-ld-api/#iri-expansion
+
+  ;; "The algorithm takes two required and four optional input
+  ;; variables. The required inputs are an active context and a value
+  ;; to be expanded. The optional inputs are two flags, document
+  ;; relative and vocab, that specifying whether value can be
+  ;; interpreted as a relative IRI reference against the document's
+  ;; base IRI or the active context's vocabulary mapping,
+  ;; respectively, and a local context and a map defined to be used
+  ;; when this algorithm is used during Context Processing. If not
+  ;; passed, the two flags are set to false and local context and
+  ;; defined are initialized to null."
+  ([active-context value] (expand-iri active-context value nil))
   ([active-context
-    type
+    value
     {:keys [document-relative? vocab? local-context defined]}]
    (RuntimeException. "TODO implement")))
 
@@ -303,8 +319,155 @@
                   ;; entries with those from context."
                   ::ex/else import-context ; see `merge` above
                   ))]
-     ;; TODO continue with 5.7
-     )))
+     ;; "(5.7) If context has an @base entry and remote contexts is
+     ;; empty, i.e., the currently being processed context is not a
+     ;; remote context:"
+     ::ex/let [result
+               (merge
+                result
+                (ex/cond
+                  ::ex/when (empty? remote-contexts)
+                  ;; "(5.7.1) Initialize value to the value associated
+                  ;; with the @base entry."
+                  ::ex/when-let [[_ value] (get context "@base")]
+                  ;; "(5.7.2) If value is null, remove the base IRI of
+                  ;; result."
+                  (nil? value) {:base-iri nil}
+                  ;; "(5.7.3) Otherwise, if value is an absolute IRI,
+                  ;; the base IRI of result is set to value."
+                  (absolute-iri? value) {:base-iri value}
+                  ;; "(5.7.4) Otherwise, if value is a relative IRI
+                  ;; and the base IRI of result is not null, set the
+                  ;; base IRI of result to the result of resolving
+                  ;; value against the current base IRI of result."
+                  (and (relative-iri? value)
+                       (some-> result :base-iri))
+                  {:base-iri (resolve-against (:base-iri result) value)}
+                  ;; "(5.7.5) Otherwise, an invalid base IRI error has
+                  ;; been detected and processing is aborted."
+                  ::ex/else (throw (ex-info "invalid base IRI"
+                                            {:base-iri value}))))]
+     ;; "(5.8) If context has an @vocab entry:"
+     ::ex/let [result
+               (merge
+                result
+                (ex/cond
+                  ;; "(5.8.1) Initialize value to the value associated
+                  ;; with the @vocab entry."
+                  ::ex/when-let [[_ value] (find context "@vocab")]
+                  ;; "(5.8.2) If value is null, remove any vocabulary
+                  ;; mapping from result."
+                  (nil? value) {:vocabulary-mapping nil}
+                  ;; "(5.8.3) Otherwise, if value is an IRI or blank
+                  ;; node identifier, the vocabulary mapping of result
+                  ;; is set to the result of using the IRI Expansion
+                  ;; algorithm, passing result as the active context,
+                  ;; value, true for vocab, and true for document
+                  ;; relative. . If it is not an IRI, or a blank node
+                  ;; identifier, an invalid vocab mapping error has
+                  ;; been detected and processing is aborted."
+                  ((some-fn iri? blank-node-identifier?) value)
+                  (expand-iri result value
+                              {:vocab? true :document-relative? true})
+                  ::ex/else (throw (ex-info "invalid vocab mapping"
+                                            {:invalid-vocab value}))))]
+     ;; "(5.9) If context has an @language entry:"
+     ::ex/let [result
+               (merge
+                result
+                (ex/cond
+                  ;; "(5.9.1) Initialize value to the value associated
+                  ;; with the @language entry."
+                  ::ex/when-let [[_ value] (get context "@langauge")]
+                  ;; "(5.9.2) If value is null, remove any default
+                  ;; language from result."
+                  (nil? value) {:default-language nil}
+                  ;; "(5.9.3) Otherwise, if value is string, the
+                  ;; default language of result is set to value. If it
+                  ;; is not a string, an invalid default language
+                  ;; error has been detected and processing is
+                  ;; aborted. If value is not well-formed according to
+                  ;; section 2.2.9 of [BCP47], processors SHOULD issue
+                  ;; a warning. Processors MAY normalize language tags
+                  ;; to lower case."
+                  (string? value) {:default-language value} ; TODO
+                                                            ; issue
+                                                            ; warning
+                                                            ; and
+                                                            ; normalize
+                  ::ex/else (throw (ex-info "invalid default language"
+                                            {:invalid-language value}))))]
+     ;; "(5.10) If context has an @direction entry:"
+     ::ex/let [result
+               (merge
+                result
+                (ex/cond
+                  ;; "(5.10.2) Initialize value to the value
+                  ;; associated with the @direction entry."
+                  ::ex/when-let [[_ value] (find context "@direction")]
+                  ;; "(5.10.1) If processing mode is json-ld-1.0, an
+                  ;; invalid context entry error has been detected and
+                  ;; processing is aborted."
+                  ::ex/do (when (= processing-mode :json-ld-1.0)
+                            (throw (ex-info "invalid context entry"
+                                            {:processing-mode processing-mode
+                                             :unsupported-feature "@direction"})))
+                  ;; "(5.10.3) If value is null, remove any base
+                  ;; direction from result."
+                  (nil? value) {:base-direction nil}
+                  ;; "(5.10.4) Otherwise, if value is string, the base
+                  ;; direction of result is set to value. If it is not
+                  ;; null, "ltr", or "rtl", an invalid base direction
+                  ;; error has been detected and processing is
+                  ;; aborted."
+                  ::ex/do (when-not (and (string? value)
+                                         (contains? #{"ltr" "rtl"} value))
+                            (throw (ex-info "invalid base direction"
+                                            {:invalid-base-direction value })))
+                  ::ex/else {:base-direction value}))]
+     ;; "(5.11) If context has an @propagate entry:"
+     ::ex/do (ex/cond
+               ::ex/when-let [[_ value] (get context "@propagate")]
+               ;; "(5.11.1)" If processing mode is json-ld-1.0, an
+               ;; invalid context entry error has been detected and
+               ;; processing is aborted.
+               (= processing-mode :json-ld-1.0)
+               (throw (ex-info "invalid context entry"
+                               {:processing-mode processing-mode
+                                :unsupported-feature "@propagate"}))
+               ;; "(5.11.2) Otherwise, if its value is not boolean
+               ;; true or false, an invalid @propagate value error has
+               ;; been detected and processing is aborted."
+               (not (boolean? value))
+               (throw (ex-info "invalid @propagate value"
+                               {"@propagate" value}))
+               ;; "(5.11.3) Otherwise, previous context was determined
+               ;; before, and no further processing is necessary."
+               ;; TODO: is there anything to do here? Set `result`?
+               ;; stop processing?
+               )
+     ;; "(5.12) Create a map defined to keep track of whether or not a
+     ;; term has already been defined or is currently being defined
+     ;; during recursion."
+     ::ex/let [defined {}]
+     ;; "(5.13) For each key-value pair in context where key is not
+     ;; @base, @direction, @import, @language, @propagate, @protected,
+     ;; @version, or @vocab, invoke the Create Term Definition
+     ;; algorithm, passing result for active context, context for
+     ;; local context, key, defined, the value of the @protected entry
+     ;; from context, if any, for protected, and propagate ."
+     ::ex/else (recur
+                local-context
+                (:context
+                 (reduce
+                  (fn [{result :context :keys [defined]} [_ v]]
+                    (create-term-definition result context v defined
+                                            ;; TODO many other params
+                                            ))
+                  {:context result :defined defined}
+                  (apply dissoc context
+                         #{"@base" "@direction" "@import" "@language"
+                           "@propagate" "@protected" "@version" "@vocab"})))))))
 
 (defn create-term-definition
   "https://www.w3.org/TR/json-ld-api/#h3_create-term-definition"
