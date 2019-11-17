@@ -67,6 +67,8 @@
   ;; also, maybe do this as a set of the JSON-LD reserved keywords.
   (RuntimeException. "TODO implement"))
 
+(defn keyword-form? [s] (re-matches #"@\p{Alpha}+" s))
+
 (defn expand-iri
   ;; https://w3c.github.io/json-ld-api/#iri-expansion
 
@@ -209,6 +211,7 @@
                                    (throw (ex-info "context overflow"
                                                    {:max max-remote-contexts
                                                     :remote-contexts remote-contexts})))
+                         ::ex/let [remote-contexts (conj remote-contexts context)]
                          ;; "(5.2.3) If context was previously
                          ;; dereferenced, then the processor MUST NOT
                          ;; do a further dereference, and context is
@@ -249,7 +252,9 @@
                (when-not (= value 1.1)
                  ;; yes, really, this floating-point number. See
                  ;; @version under
-                 ;; https://w3c.github.io/json-ld-syntax/#syntax-tokens-and-keywords.
+                 ;; https://w3c.github.io/json-ld-syntax/#syntax-tokens-and-keywords. See
+                 ;; also
+                 ;; https://github.com/w3c/json-ld-syntax/issues/296.
                  (throw (ex-info "invalid @version value"
                                  {:value value})))
                ;; "(5.5.2) If processing mode is set to json-ld-1.0, a
@@ -460,26 +465,46 @@
                 local-context
                 (:context
                  (reduce
+                  ;; TODO hoist this fn into a let binding
                   (fn [{result :context :keys [defined]} [_ v]]
-                    (create-term-definition result context v defined
-                                            ;; TODO many other params
-                                            ))
+                    (create-term-definition
+                     result context v defined
+                     (merge
+                      (when-let [[_ protected] (find context "@protected")]
+                        {:protected protected})
+                      ;; TODO many other params
+                      )))
                   {:context result :defined defined}
                   (apply dissoc context
                          #{"@base" "@direction" "@import" "@language"
                            "@propagate" "@protected" "@version" "@vocab"})))))))
 
 (defn create-term-definition
-  "https://www.w3.org/TR/json-ld-api/#h3_create-term-definition"
-  ;; "(§ 6.2) Create Term Definition – This algorithm is called from
-  ;; the Context Processing algorithm to create a term definition in
-  ;; the active context for a term being processed in a local
-  ;; context."
+  "https://w3c.github.io/json-ld-api/#create-term-definition
 
-  ;; returns: a new active context, a new `defined` (recursion),
-  ;; [others?]. I think the right structure to return might be
-  ;; {:context ... :defined ...}.
-  [active-context local-context term defined]
+  \"(§ 4.2) This algorithm is called from the Context Processing
+  algorithm to create a term definition in the active context for a
+  term being processed in a local context.\"
+
+  \"(§ 4.2.2) The algorithm has four required and three optional
+  inputs. The required inputs are an active context, a local context,
+  a term, and a map defined. The optional inputs are protected which
+  defaults to false, override protected, defaulting to false, which is
+  used to allow changes to protected terms, and propagate, defaulting
+  to true..\"
+
+  returns: a new active context, a new `defined` (recursion),
+  [others?]. I think the right structure to return might be {:context
+  ... :defined ...}. (TODO)"
+  [active-context
+   local-context
+   term
+   defined
+   {:keys [protected override-protected propagate processing-mode]
+    :or {protected false
+         override-protected false
+         propagate true}}]
+  #_
   (engelberg/cond
     ;; "(1) If defined contains the key term and the associated value
     ;; is true (indicating that the term definition has already been
@@ -743,4 +768,321 @@
     ;; definition and set the value associated with defined's key term
     ;; to true."
     {:context (assoc-in active-context [:term-definitions term] definition)
-     :defined (assoc defined term true)}))
+     :defined (assoc defined term true)})
+  (ex/cond
+    ;; "(1) If defined contains the entry term and the associated
+    ;; value is true (indicating that the term definition has already
+    ;; been created), return. Otherwise, if the value is false, a
+    ;; cyclic IRI mapping error has been detected and processing is
+    ;; aborted."
+    (contains? defined term) (if (defined term)
+                               ;; TODO right thing to return?
+                               {:context active-context :defined defined}
+                               (throw (ex-info "cyclic IRI mapping"
+                                               { ;; TODO show the cycle
+                                                :defined defined
+                                                :collided-term term})))
+    ;; "(2) Set the value associated with defined's term entry to
+    ;; false. This indicates that the term definition is now being
+    ;; created but is not yet complete."
+    ::ex/let [defined (assoc defined term false)]
+    ;; "(3) Initialize value to a copy of the value associated with
+    ;; the entry term in local context."
+    ::ex/let [value (get local-context term)]
+    ;; "(4) If term is @type, and processing mode is json-ld-1.0, a
+    ;; keyword redefinition error has been detected and processing is
+    ;; aborted. At this point, value MUST be a map with only the entry
+    ;; @container and value @set and optional entry @protected. Any
+    ;; other value means that a keyword redefinition error has been
+    ;; detected and processing is aborted."
+    (and (= term "@type")
+         (= processing-mode :json-ld-1.0))
+    (throw (ex-info "keyword redefinition"
+                    {:keyword term}))
+    ;; "(5) Otherwise, since keywords cannot be overridden, term MUST
+    ;; NOT be a keyword and a keyword redefinition error has been
+    ;; detected and processing is aborted. If term has the form of a
+    ;; keyword (i.e., it matches the ABNF rule "@"1*ALPHA from
+    ;; [RFC5234]), return; processors SHOULD generate a warning."
+    (keyword-form? term)
+    (if (#{"@base" "@container" "@context" "@direction" "@graph" "@id" "@import"
+           "@included" "@index" "@json" "@language" "@list" "@nest" "@none"
+           "@prefix" "@propagate" "@protected" "@reverse" "@set" "@type"
+           "@value" "@version" "@vocab"}
+         term)
+      (throw (ex-info "keyword redefinition"
+                      {:keyword term}))
+      (do ;; TODO warn
+        {:context active-context :defined defined}))
+    ;; "(6) Initialize previous definition to any existing term
+    ;; definition for term in active context, removing that term
+    ;; definition from active context."
+    ::ex/let [previous-definition (get-in active-context
+                                          [:term-definitions term])
+              ;; TODO motivation for dissoc-in
+              active-context (update active-context
+                                     :term-definitions
+                                     #(dissoc % term))]
+    ;; "(7) If value is null, convert it to a map consisting of a
+    ;; single entry whose key is @id and whose value is null."
+    ::ex/let [value (if (nil? value)
+                      {"@id" nil}
+                      value)]
+    ;; "(8) Otherwise, if value is a string, convert it to a map
+    ;; consisting of a single entry whose key is @id and whose value
+    ;; is value. Set simple term to true."
+    ::ex/let [[value simple-term] (if (string? value)
+                                    [{"@id" value} true]
+                                    [value false])]
+    ;; "(9) Otherwise, value MUST be a map, if not, an invalid term
+    ;; definition error has been detected and processing is
+    ;; aborted. Set simple term to false. [see above]"
+    (not (associative? value))
+    (throw (ex-info "invalid term definition: unexpected type"
+                    {:term value}))
+    ;; "(10) Create a new term definition, definition."
+    ::ex/let [definition {}]
+    ;; "(11) If the @protected entry in value is true set the
+    ;; protected flag in definition to true. If the value of
+    ;; @protected is not a boolean, an invalid @protected value error
+    ;; has been detected and processing is aborted. If processing mode
+    ;; is json-ld-1.0, an invalid term definition has been detected
+    ;; and processing is aborted."
+    ::ex/let [definition
+              (merge
+               definition
+               (ex/cond
+                 ::ex/when-let [[_ protected] (find value "@protected")]
+                 (not (boolean? protected))
+                 (throw (ex-info "invalid @protected value"
+                                 {"@protected" protected}))
+                 (= processing-mode :json-ld-1.0)
+                 (throw (ex-info "invalid term definition"
+                                 {:unsupported-feature "@protected"}))
+                 (true? protected) {:protected true}))]
+    ;; "(12) Otherwise, if there is no @protected entry in value and
+    ;; the protected parameter is true, set the protected in
+    ;; definition to true."
+
+    ;; TODO: (11) and (12) together form a decision table. Maybe make
+    ;; some extensible-cond bindings to `core.match`?
+    ::ex/let [definition
+              (merge
+               definition
+               (ex/cond
+                 ::ex/when (not (contains? value "@protected"))
+                 protected {:protected true}))]
+    ;; "(13) If value contains the entry @type:"
+    ::ex/let [definition
+              (merge
+               definition
+               (ex/cond
+                 ;; "(13.1) Initialize type to the value associated
+                 ;; with the @type entry, which MUST be a
+                 ;; string. Otherwise, an invalid type mapping error
+                 ;; has been detected and processing is aborted."
+                 ::ex/when-let [[_ type] (find value "@type")]
+                 ;; "(13.2) Set type to the result of using the IRI
+                 ;; Expansion algorithm, passing active context, type
+                 ;; for value, true for vocab, local context, and
+                 ;; defined."
+                 ::ex/let [type (expand-iri active-context
+                                            type
+                                            {:defined defined})]
+                 ;; "(13.3) If the expanded type is @json or @none,
+                 ;; and processing mode is json-ld-1.0, an invalid
+                 ;; type mapping error has been detected and
+                 ;; processing is aborted."
+                 (and (#{"@json" "@none"} type)
+                      (= processing-mode :json-ld-1.0))
+                 ;; "(13.4) Otherwise, if the expanded type is neither
+                 ;; @id, nor @vocab, nor an IRI, an invalid type
+                 ;; mapping error has been detected and processing is
+                 ;; aborted."
+                 (not (or (#{"@id" "@vocab"} type)
+                          (iri? type)))
+                 (throw (ex-info "invalid type mapping"
+                                 {:invalid-type type}))
+                 ;; "(13.5) Set the type mapping for definition to
+                 ;; type."
+                 {:type type}))]
+    ;; "(14) If value contains the entry @reverse:"
+    (contains? value "@reverse")
+    (ex/cond
+      ::ex/let [[_ reverse] (find value "@reverse")]
+      ;; "(14.1) If value contains @id or @nest, entries, an invalid
+      ;; reverse property error has been detected and processing is
+      ;; aborted."
+      (or (contains? value "@id")
+          (contains? value "@nest"))
+      (throw (ex-info "invalid reverse property"
+                      (select-keys
+                       value #{"@reverse" "@id" "@nest"})))
+      ;; "(14.2) If the value associated with the @reverse entry is
+      ;; not a string, an invalid IRI mapping error has been detected
+      ;; and processing is aborted."
+      (not (string? reverse))
+      (throw (ex-info "invalid IRI mapping"
+                      {:iri reverse}))
+      ;; "(14.3) If the value associated with the @reverse entry is a
+      ;; string having the form of a keyword (i.e., it matches the
+      ;; ABNF rule "@"1*ALPHA from [RFC5234]), return; processors
+      ;; SHOULD generate a warning."
+      ((every-pred string? keyword-form?) reverse)
+      (do
+        ;; TODO issue warning
+        {:context active-context :defined defined})
+      ;; "(14.4) Otherwise, set the IRI mapping of definition to the
+      ;; result of using the IRI Expansion algorithm, passing active
+      ;; context, the value associated with the @reverse entry for
+      ;; value, true for vocab, local context, and defined. If the
+      ;; result does not have the form of an IRI or a blank node
+      ;; identifier, an invalid IRI mapping error has been detected
+      ;; and processing is aborted."
+      ::ex/let [iri-mapping (expand-iri
+                             active-context reverse
+                             {:vocab? true
+                              :local-context local-context
+                              :defined defined})]
+      (not ((some-fn iri? blank-node-identifier?) iri-mapping))
+      (throw (ex-info "invalid IRI mapping"
+                      {:iri-mapping iri-mapping}))
+      ::ex/let [definition (assoc definition
+                                  :iri-mapping
+                                  iri-mapping)]
+      ;; "(14.5) If value contains an @container entry, set
+      ;; the container mapping of definition to an array
+      ;; containing its value; if its value is neither @set,
+      ;; nor @index, nor null, an invalid reverse property
+      ;; error has been detected (reverse properties only
+      ;; support set- and index-containers) and processing
+      ;; is aborted."
+      ::ex/let [definition
+                (merge
+                 definition
+                 (ex/cond
+                   ::ex/when-let [[_ container] (find value "@container")]
+                   (not (contains? #{"@set" "@index" nil} container))
+                   (throw (ex-info "invalid reverse property"
+                                   {"@container" container}))
+                   ::ex/else {:container-mapping container}))]
+      ;; "(14.6) Set the reverse property flag of definition to true."
+      ::ex/let [defintion (assoc definition :reverse-property? true)]
+      ;; "(14.7) Set the term definition of term in active context to
+      ;; definition and the value associated with defined's entry term
+      ;; to true and return."
+      ::ex/else {:context (assoc-in active-context
+                                    [:term-definitions term]
+                                    definition)
+                 :defined (assoc defined term true)})
+    ::ex/let [definition (assoc definition :reverse-property? false)]
+    ;; "(16) If value contains the entry @id and its value does not
+    ;; equal term:"
+    ::ex/let [definition
+              (merge
+               definition
+               (ex/cond
+                 ::ex/when-let [[_ id] (find value "@id")]
+                 ::ex/when (not= id term)
+                 ;; "(16.1) If value contains the @id entry is null,
+                 ;; the term is not used for IRI expansion, but is
+                 ;; retained to be able to detect future redefinitions
+                 ;; of this term." TODO fix wording of WD here.
+                 (nil? id)
+                 (throw (UnsupportedOperationException.
+                         "bug: I don't know what to do here")
+                        ;; TODO I am guessing the right thing to do is
+                        ;; to return, but I need to verify.
+                        )
+                 ;; "(16.2) Otherwise, if the value associated with
+                 ;; the @id entry is not a string, an invalid IRI
+                 ;; mapping error has been detected and processing is
+                 ;; aborted."
+                 (not (string? id))
+                 (throw (ex-info "invalid IRI mapping"
+                                 {"@id" id}))
+                 ;; "(16.3) If the value associated with the @id entry
+                 ;; is not a keyword, but has the form of a keyword
+                 ;; (i.e., it matches the ABNF rule "@"1*ALPHA from
+                 ;; [RFC5234]), return; processors SHOULD generate a
+                 ;; warning."
+                 (and (not (keyword? id))
+                      (keyword-form? id))
+                 ;; TODO restructure so that returning from here is
+                 ;; possible
+                 (throw (UnsupportedOperationException.
+                         "bug"))
+                 ;; "(16.4) Otherwise, set the IRI mapping of
+                 ;; definition to the result of using the IRI
+                 ;; Expansion algorithm, passing active context, the
+                 ;; value associated with the @id entry for value,
+                 ;; true for vocab, local context, and defined. If the
+                 ;; resulting IRI mapping is neither a keyword, nor an
+                 ;; IRI, nor a blank node identifier, an invalid IRI
+                 ;; mapping error has been detected and processing is
+                 ;; aborted; if it equals @context, an invalid keyword
+                 ;; alias error has been detected and processing is
+                 ;; aborted."
+                 ::ex/let [iri-mapping (expand-iri
+                                        active-context
+                                        id
+                                        {:vocab? true
+                                         :local-context local-context
+                                         :defined defined})]
+                 (not ((some-fn keyword? iri? blank-node-identifier?)
+                       iri-mapping))
+                 (throw (ex-info "invalid IRI mapping"
+                                 {:iri-mapping iri-mapping}))
+                 (= iri-mapping "@context")
+                 (throw (ex-info "invalid keyword alias"
+                                 {:iri-mapping iri-mapping}))
+                 ::ex/let [definition (assoc definition
+                                             :iri-mapping
+                                             iri-mapping)]
+                 ;; "(16.5) If the term contains a colon (:) anywhere
+                 ;; but as the first or last character of term, or if
+                 ;; it contains a slash (/) anywhere, and for either
+                 ;; case, the result of expanding term using the IRI
+                 ;; Expansion algorithm, passing active context, term
+                 ;; for value, true for vocab, local context, and
+                 ;; defined, is not the same as the IRI mapping of
+                 ;; definition, an invalid IRI mapping error has been
+                 ;; detected and processing is aborted."
+                 (and (or (re-matches #".+:.+" term)
+                          (str/includes? term "/"))
+                      (not= (expand-iri active-context term
+                                        {:vocab? true
+                                         :local-context local-context
+                                         :defined defined})
+                            (:iri-mapping definition)))
+                 (throw (ex-info "invalid IRI mapping"
+                                 {:iri-mapping (:iri-mapping definition)
+                                  :term term}))
+                 ;; "(16.6) If term contains neither a colon (:) nor a
+                 ;; slash (/), simple term is true, and if the IRI
+                 ;; mapping of definition ends with a URI gen-delim
+                 ;; character
+                 ;; [https://tools.ietf.org/html/rfc3986#section-2.2],
+                 ;; set the prefix flag in definition to true."
+                 ::ex/let [definition
+                           (merge
+                            definition
+                            (when (and (not (str/includes? term ":"))
+                                       (not (str/includes? term "/"))
+                                       simple-term
+                                       ;; Implementation note: we do
+                                       ;; not do
+                                       #_ (last (:iri-mapping definition))
+                                       ;; here because `seq` on a
+                                       ;; string does not return a seq
+                                       ;; of unicode codepoints.
+                                       ((apply
+                                         some-fn
+                                         (map (fn [gen-delim]
+                                                #(str/ends-with? % gen-delim))
+                                              #{":" "/" "?" "#" "[" "]" "@"}))
+                                        (:iri-mapping definition)))
+                              {:prefix? true}))]))]
+    ;; TODO: need to restructure the above to continue with "(17)
+    ;; Otherwise, ..."
+    ))
